@@ -144,17 +144,17 @@ jobs:
                   for m in newly_listed
               ]
               notifications.append((
-                  "Veloretti outlet: Ace Two gevonden",
-                  "Nieuw in de outlet:\\n" + "\\n".join(lines),
+                  "Hij is nu beschikbaar!",
+                  "Deze fiets is nu beschikbaar in de Veloretti-outlet.\\nKoop hem hier:\\n" + "\\n".join(lines),
               ))
           if price_changes:
               lines = [
-                  f"Ace Two {model.title()}: {before} → {now}\\n{CUSTOMIZER_URL}"
+                  f"Ace Two {model.title()}\\nOude prijs: {before}\\nNieuwe prijs: {now}\\nBekijk de pagina: {CUSTOMIZER_URL}"
                   for model, before, now in price_changes
               ]
               notifications.append((
-                  "Veloretti: prijs gewijzigd",
-                  "Prijswijziging op de Ace Two customizerpagina:\\n" + "\\n".join(lines),
+                  "Let op, prijsverandering",
+                  "De prijs van de Ace Two is veranderd.\\n\\n" + "\\n\\n".join(lines),
               ))
 
           if notifications:
