@@ -20,7 +20,6 @@ jobs:
         run: |
           python - <<'PY'
           import html
-          import json
           import os
           import re
           import sys
@@ -29,7 +28,7 @@ jobs:
 
           OUTLET = "https://www.veloretti.com/nl/outlet"
           NEEDLE = "ace two pro black edition"
-          topic = os.environ.get("NTFY_TOPIC", "").strip()
+          topic_input = os.environ.get("NTFY_TOPIC", "").strip()
 
           req = urllib.request.Request(
               OUTLET,
@@ -44,11 +43,9 @@ jobs:
 
           decoded = html.unescape(page)
           normalized = re.sub(r"\\s+", " ", re.sub(r"<[^>]+>", " ", decoded)).lower()
-          if NEEDLE not in normalized:
-              # Shopify pages may include product data as JSON in the source. Check decoded source too.
-              if NEEDLE not in re.sub(r"\\s+", " ", decoded.lower()):
-                  print("Ace Two Pro Black Edition not found.")
-                  sys.exit(0)
+          if NEEDLE not in normalized and NEEDLE not in re.sub(r"\\s+", " ", decoded.lower()):
+              print("Ace Two Pro Black Edition not found.")
+              sys.exit(0)
 
           links = re.findall(r"""href=["']([^"']+)["']""", decoded, flags=re.IGNORECASE)
           candidate_urls = []
@@ -63,13 +60,25 @@ jobs:
           ]
           product_url = product_urls[0] if product_urls else OUTLET
 
-          if not topic:
+          if not topic_input:
               print("Product found, but NTFY_TOPIC secret is not configured.", file=sys.stderr)
               sys.exit(1)
 
+          parsed_topic = urllib.parse.urlparse(
+              topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input
+          )
+          if parsed_topic.scheme != "https" or not parsed_topic.netloc:
+              print("NTFY_TOPIC must be an https ntfy topic URL or topic name.", file=sys.stderr)
+              sys.exit(1)
+          topic_path = parsed_topic.path.strip("/")
+          if not topic_path:
+              print("NTFY_TOPIC URL must include a topic name.", file=sys.stderr)
+              sys.exit(1)
+          ntfy_url = f"https://{parsed_topic.netloc}/{topic_path}"
+
           message = f"Ace Two Pro Black Edition is listed in the Veloretti Outlet: {product_url}"
           request = urllib.request.Request(
-              "https://ntfy.sh/" + urllib.parse.quote(topic, safe=""),
+              ntfy_url,
               data=message.encode("utf-8"),
               headers={
                   "Title": "Veloretti outlet: fiets gevonden",
