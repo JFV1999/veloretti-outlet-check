@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      - uses: actions/checkout@v4
       - name: Restore previous price state
         uses: actions/cache/restore@v4
         with:
@@ -26,129 +27,10 @@ jobs:
           restore-keys: |
             veloretti-prices-
 
-      - name: Check outlet availability and official Ace Two prices
+      - name: Check outlet and prices
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: |
-          python - <<'PY'
-          import html
-          import json
-          import os
-          import re
-          import sys
-          import urllib.parse
-          import urllib.request
-
-          OUTLET_URL = "https://www.veloretti.com/nl/outlet"
-          CUSTOMIZER_URL = "https://www.veloretti.com/nl/electric-bikes/ace-two/customizer"
-          STATE_PATH = "state/prices.json"
-          PRODUCT_RE = re.compile(r"ace\\s+two\\s+(pro|lite)", re.IGNORECASE)
-
-          def fetch(url):
-              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"})
-              with urllib.request.urlopen(req, timeout=30) as response:
-                  return response.read().decode("utf-8", errors="replace")
-
-          def plain_text(source):
-              source = html.unescape(source)
-              source = re.sub(r"<script\\b[^>]*>.*?</script>", " ", source, flags=re.I | re.S)
-              source = re.sub(r"<style\\b[^>]*>.*?</style>", " ", source, flags=re.I | re.S)
-              return re.sub(r"\\s+", " ", re.sub(r"<[^>]+>", " ", source)).strip()
-
-          try:
-              outlet_html = fetch(OUTLET_URL)
-              customizer_html = fetch(CUSTOMIZER_URL)
-          except Exception as exc:
-              print(f"Could not fetch Veloretti pages: {exc}", file=sys.stderr)
-              sys.exit(1)
-
-          outlet_source = html.unescape(outlet_html).replace("\\/", "/")
-          anchor_pattern = r"""<a\\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>"""
-          outlet_products = {}
-          for href, anchor_html in re.findall(anchor_pattern, outlet_source, flags=re.I | re.S):
-              title = re.sub(r"\\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", anchor_html))).strip()
-              model_match = PRODUCT_RE.search(title)
-              if not model_match:
-                  continue
-              url = urllib.parse.urljoin(OUTLET_URL, href)
-              if urllib.parse.urlparse(url).hostname not in ("www.veloretti.com", "veloretti.com"):
-                  continue
-              outlet_products[model_match.group(1).lower()] = {"title": title, "url": url}
-
-          # The live customizer page lists the Lite section and its price, then the Pro section and price.
-          customizer_text = plain_text(customizer_html)
-          prices = {}
-          for model, next_model in (("lite", "pro"), ("pro", "model wijzigen")):
-              section = re.search(rf"\\b{model}\\b(.*?)(?=\\b{next_model}\\b)", customizer_text, flags=re.I)
-              if not section:
-                  print(f"Could not find {model.title()} price section.", file=sys.stderr)
-                  sys.exit(1)
-              price = re.search(r"€\\s*[0-9][0-9.]*,[0-9]{2}", section.group(1))
-              if not price:
-                  print(f"Could not extract {model.title()} price; aborting to avoid false alerts.", file=sys.stderr)
-                  sys.exit(1)
-              prices[model] = re.sub(r"\\s+", "", price.group(0))
-
-          STATE_PATH = "state/prices.json"
-          try:
-              with open(STATE_PATH, "r", encoding="utf-8") as file:
-                  old_state = json.load(file)
-          except FileNotFoundError:
-              old_state = {}
-          except Exception as exc:
-              print(f"Could not read cached price state: {exc}", file=sys.stderr)
-              sys.exit(1)
-
-          price_changes = [
-              (model, old_state["customizer_prices"][model], prices[model])
-              for model in ("lite", "pro")
-              if model in old_state.get("customizer_prices", {})
-              and old_state["customizer_prices"][model] != prices[model]
-          ]
-          old_outlet = old_state.get("outlet_models", {})
-          newly_listed = [model for model in outlet_products if model not in old_outlet]
-
-          notifications = []
-          for model in newly_listed:
-              product = outlet_products[model]
-              notifications.append((
-                  "Hij is nu beschikbaar!",
-                  f"{product['title']} is nu beschikbaar in de Veloretti-outlet.\\nKoop hem hier: {product['url']}"
-              ))
-          for model, before, now in price_changes:
-              notifications.append((
-                  "Let op, prijsverandering",
-                  f"Ace Two {model.title()}\\nOude prijs: {before}\\nNieuwe prijs: {now}\\nBekijk de pagina: {CUSTOMIZER_URL}"
-              ))
-
-          if notifications:
-              topic_input = os.environ.get("NTFY_TOPIC", "").strip()
-              parsed = urllib.parse.urlparse(topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input)
-              if parsed.scheme != "https" or not parsed.netloc or not parsed.path.strip("/"):
-                  print("NTFY_TOPIC must contain an https ntfy topic URL or topic name.", file=sys.stderr)
-                  sys.exit(1)
-              ntfy_url = f"https://{parsed.netloc}/{parsed.path.strip('/')}"
-              for title, message in notifications:
-                  req = urllib.request.Request(
-                      ntfy_url,
-                      data=message.encode("utf-8"),
-                      headers={"Title": title, "Priority": "high", "Tags": "bike", "Content-Type": "text/plain; charset=utf-8"},
-                      method="POST",
-                  )
-                  try:
-                      with urllib.request.urlopen(req, timeout=20) as response:
-                          print(f"Sent notification: {title} (HTTP {response.status}).")
-                  except Exception as exc:
-                      print(f"Could not send ntfy notification: {exc}", file=sys.stderr)
-                      sys.exit(1)
-          else:
-              print("No new outlet listing or price change; no notification.")
-
-          os.makedirs("state", exist_ok=True)
-          with open(STATE_PATH, "w", encoding="utf-8") as file:
-              json.dump({"customizer_prices": prices, "outlet_models": outlet_products},
-                        file, ensure_ascii=False, indent=2)
-          print(f"Saved state; Lite={prices['lite']}, Pro={prices['pro']}.")
+        run: python scripts/check_veloretti.py
 
       - name: Save current price state
         uses: actions/cache/save@v4
