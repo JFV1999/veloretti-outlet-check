@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: veloretti-outlet-check
@@ -19,21 +19,22 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
-      - name: Restore previous price state
-        uses: actions/cache/restore@v4
         with:
-          path: state/prices.json
-          key: veloretti-prices-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            veloretti-prices-
+          persist-credentials: true
 
       - name: Check outlet and prices
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python scripts/check_veloretti.py
 
-      - name: Save current price state
-        uses: actions/cache/save@v4
-        with:
-          path: state/prices.json
-          key: veloretti-prices-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save price history to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/prices.json
+          if git diff --cached --quiet; then
+            echo "Price history is unchanged."
+          else
+            git commit -m "Update Veloretti price history"
+            git push
+          fi
