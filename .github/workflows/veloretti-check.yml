@@ -7,28 +7,35 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: veloretti-outlet-check
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      - name: Restore previous price state
+        uses: actions/cache/restore@v4
+        with:
+          path: state/prices.json
+          key: veloretti-prices-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            veloretti-prices-
+
       - name: Check outlet availability and official Ace Two prices
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          GITHUB_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
         run: |
           python - <<'PY'
-          import base64
           import html
           import json
           import os
           import re
           import sys
-          import urllib.error
           import urllib.parse
           import urllib.request
 
@@ -82,29 +89,14 @@ jobs:
                   sys.exit(1)
               prices[model] = re.sub(r"\\s+", "", price.group(0))
 
-          repo, branch = os.environ["REPOSITORY"], os.environ["BRANCH"]
-          api_base = "https://api.github.com"
-          api_headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
-              "X-GitHub-Api-Version": "2022-11-28",
-              "User-Agent": "VelorettiOutletChecker",
-          }
-          state_url = f"{api_base}/repos/{repo}/contents/{STATE_PATH}?ref={urllib.parse.quote(branch)}"
+          STATE_PATH = "state/prices.json"
           try:
-              req = urllib.request.Request(state_url, headers=api_headers)
-              with urllib.request.urlopen(req, timeout=20) as response:
-                  state_file = json.loads(response.read())
-              old_state = json.loads(base64.b64decode(state_file["content"]).decode("utf-8"))
-              state_sha = state_file["sha"]
-          except urllib.error.HTTPError as exc:
-              if exc.code == 404:
-                  old_state, state_sha = {}, None
-              else:
-                  print(f"Could not load saved state: HTTP {exc.code}", file=sys.stderr)
-                  sys.exit(1)
+              with open(STATE_PATH, "r", encoding="utf-8") as file:
+                  old_state = json.load(file)
+          except FileNotFoundError:
+              old_state = {}
           except Exception as exc:
-              print(f"Could not read saved state: {exc}", file=sys.stderr)
+              print(f"Could not read cached price state: {exc}", file=sys.stderr)
               sys.exit(1)
 
           price_changes = [
@@ -152,24 +144,14 @@ jobs:
           else:
               print("No new outlet listing or price change; no notification.")
 
-          state = {"customizer_prices": prices, "outlet_models": outlet_products}
-          body = {
-              "message": "Update Veloretti outlet and price state",
-              "content": base64.b64encode(json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
-              "branch": branch,
-          }
-          if state_sha:
-              body["sha"] = state_sha
-          req = urllib.request.Request(
-              f"{api_base}/repos/{repo}/contents/{STATE_PATH}",
-              data=json.dumps(body).encode("utf-8"),
-              headers={**api_headers, "Content-Type": "application/json"},
-              method="PUT",
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=20) as response:
-                  print(f"Saved current state (HTTP {response.status}); prices: {prices}.")
-          except Exception as exc:
-              print(f"Could not save state: HTTP {getattr(exc, 'code', 'unknown')}", file=sys.stderr)
-              sys.exit(1)
-          PY
+          os.makedirs("state", exist_ok=True)
+          with open(STATE_PATH, "w", encoding="utf-8") as file:
+              json.dump({"customizer_prices": prices, "outlet_models": outlet_products},
+                        file, ensure_ascii=False, indent=2)
+          print(f"Saved state; Lite={prices['lite']}, Pro={prices['pro']}.")
+
+      - name: Save current price state
+        uses: actions/cache/save@v4
+        with:
+          path: state/prices.json
+          key: veloretti-prices-${{ github.run_id }}-${{ github.run_attempt }}
