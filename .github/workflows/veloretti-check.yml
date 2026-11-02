@@ -37,20 +37,18 @@ jobs:
           PRODUCT_RE = re.compile(r"ace\\s+two\\s+(?:pro|lite)", re.IGNORECASE)
           topic_input = os.environ.get("NTFY_TOPIC", "").strip()
 
-          def request(url, data=None, headers=None, method=None):
+          def open_url(url, data=None, headers=None, method=None):
               req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
               return urllib.request.urlopen(req, timeout=25)
 
-          # Fetch the current outlet page.
           try:
-              with request(OUTLET, headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"}) as response:
+              with open_url(OUTLET, headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"}) as response:
                   page = response.read().decode("utf-8", errors="replace")
           except Exception as exc:
               print(f"Could not fetch outlet page: {exc}", file=sys.stderr)
               sys.exit(1)
 
           decoded = html.unescape(page).replace("\\/", "/")
-          # Inspect each product card's nearby HTML so prices are associated with the correct product.
           anchors = list(re.finditer(
               r"""<a\\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""",
               decoded,
@@ -63,19 +61,13 @@ jobs:
               title = re.sub(r"\\s+", " ", html.unescape(title)).strip()
               if not PRODUCT_RE.search(title):
                   continue
-
-              # Capture the surrounding Shopify product card for its displayed price text.
-              start = max(0, match.start() - 1400)
-              end = min(len(decoded), match.end() + 1800)
-              card = html.unescape(re.sub(r"<[^>]+>", " ", decoded[start:end]))
-              card = re.sub(r"\\s+", " ", card).strip()
-              price_tokens = re.findall(r"(?:€\\s*[0-9][0-9.]*(?:,[0-9]{2})?|[0-9][0-9.]*,[0-9]{2}\\s*€)", card)
-              prices = [re.sub(r"\\s+", "", p) for p in price_tokens]
+              start, end = max(0, match.start() - 1400), min(len(decoded), match.end() + 1800)
+              card = re.sub(r"\\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", decoded[start:end]))).strip()
+              prices = re.findall(r"(?:€\\s*[0-9][0-9.]*(?:,[0-9]{2})?|[0-9][0-9.]*,[0-9]{2}\\s*€)", card)
+              price = re.sub(r"\\s+", "", prices[-1]) if prices else "unknown"
               url = urllib.parse.urljoin(OUTLET, href)
-              # Most product cards show old and sale price; use the last price shown (current sale price).
-              current_price = prices[-1] if prices else "unknown"
               key = urllib.parse.urlsplit(url)._replace(query="", fragment="").geturl()
-              found[key] = {"title": title, "url": url, "price": current_price}
+              found[key] = {"title": title, "url": url, "price": price}
 
           if not found:
               print("No Ace Two Pro or Ace Two Lite outlet listings found.")
@@ -84,18 +76,13 @@ jobs:
           if not topic_input:
               print("Products found, but NTFY_TOPIC secret is not configured.", file=sys.stderr)
               sys.exit(1)
-
-          parsed_topic = urllib.parse.urlparse(
-              topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input
-          )
+          parsed_topic = urllib.parse.urlparse(topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input)
           if parsed_topic.scheme != "https" or not parsed_topic.netloc or not parsed_topic.path.strip("/"):
               print("NTFY_TOPIC must be an https ntfy topic URL or topic name.", file=sys.stderr)
               sys.exit(1)
           ntfy_url = f"https://{parsed_topic.netloc}/{parsed_topic.path.strip('/')}"
 
-          api_base = "https://api.github.com"
-          repo = os.environ["REPOSITORY"]
-          branch = os.environ["BRANCH"]
+          api_base, repo, branch = "https://api.github.com", os.environ["REPOSITORY"], os.environ["BRANCH"]
           api_headers = {
               "Accept": "application/vnd.github+json",
               "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
@@ -103,77 +90,63 @@ jobs:
               "User-Agent": "VelorettiOutletChecker",
           }
           state_url = f"{api_base}/repos/{repo}/contents/{STATE_PATH}?ref={urllib.parse.quote(branch)}"
-          state_sha = None
           try:
-              with request(state_url, headers=api_headers) as response:
+              with open_url(state_url, headers=api_headers) as response:
                   state_file = json.loads(response.read())
               old_state = json.loads(base64.b64decode(state_file["content"]).decode("utf-8"))
               state_sha = state_file["sha"]
           except urllib.error.HTTPError as exc:
               if exc.code == 404:
-                  old_state = {}
+                  old_state, state_sha = {}, None
               else:
                   print(f"Could not load price history: {exc}", file=sys.stderr)
                   sys.exit(1)
-          except Exception as exc:
-              print(f"Could not parse price history: {exc}", file=sys.stderr)
-              sys.exit(1)
 
-          # Notify only when a known listed product's current price differs from its saved price.
-          changed = []
+          # Initial observation establishes a baseline. Later changes are reported just once.
+          price_changes = []
           for key, product in found.items():
               previous = old_state.get(key)
               if previous and previous.get("price") != "unknown" and product["price"] != "unknown" and previous.get("price") != product["price"]:
-                  changed.append((previous, product))
+                  price_changes.append((previous, product))
 
-          lines = []
-          for product in found.values():
-              lines.append(f"{product['title']} — {product['price']} — {product['url']}")
-          message = "Veloretti outlet: Ace Two Pro/Lite gevonden.\\n" + "\\n".join(lines)
-          if changed:
+          lines = [f"{p['title']} — {p['price']} — {p['url']}" for p in found.values()]
+          if price_changes:
+              title = "Veloretti outlet: prijs gewijzigd"
               message = "Prijswijziging bij Veloretti outlet!\\n" + "\\n".join(
                   f"{new['title']}: {old['price']} → {new['price']}\\n{new['url']}"
-                  for old, new in changed
+                  for old, new in price_changes
               )
+          else:
+              title = "Veloretti outlet: Ace Two beschikbaar"
+              message = "Ace Two Pro/Lite staat in de outlet:\\n" + "\\n".join(lines)
 
-          # Send listing notification each run; append any price-change information.
           ntfy_req = urllib.request.Request(
-              ntfy_url,
-              data=message.encode("utf-8"),
-              headers={
-                  "Title": "Veloretti outlet: prijs gewijzigd" if changed else "Veloretti outlet: Ace Two gevonden",
-                  "Priority": "high",
-                  "Tags": "bike",
-                  "Content-Type": "text/plain; charset=utf-8",
-              },
+              ntfy_url, data=message.encode("utf-8"),
+              headers={"Title": title, "Priority": "high", "Tags": "bike", "Content-Type": "text/plain; charset=utf-8"},
               method="POST",
           )
           try:
               with urllib.request.urlopen(ntfy_req, timeout=20) as response:
-                  print(f"ntfy notification sent (HTTP {response.status}); {len(changed)} price change(s).")
+                  print(f"ntfy notification sent (HTTP {response.status}); {len(price_changes)} price change(s).")
           except Exception as exc:
               print(f"Could not send ntfy notification: {exc}", file=sys.stderr)
               sys.exit(1)
 
-          # Store the current prices for comparison on the next scheduled run.
+          state = {key: product for key, product in found.items()}
           body = {
               "message": "Update tracked Veloretti outlet prices",
-              "content": base64.b64encode(json.dumps(
-                  {key: {"title": p["title"], "url": p["url"], "price": p["price"]} for key, p in found.items()},
-                  ensure_ascii=False, indent=2
-              ).encode("utf-8")).decode("ascii"),
+              "content": base64.b64encode(json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
               "branch": branch,
           }
           if state_sha:
               body["sha"] = state_sha
-          state_req = urllib.request.Request(
-              f"{api_base}/repos/{repo}/contents/{STATE_PATH}",
-              data=json.dumps(body).encode("utf-8"),
-              headers={**api_headers, "Content-Type": "application/json"},
-              method="PUT",
-          )
           try:
-              with urllib.request.urlopen(state_req, timeout=20) as response:
+              with open_url(
+                  f"{api_base}/repos/{repo}/contents/{STATE_PATH}",
+                  data=json.dumps(body).encode("utf-8"),
+                  headers={**api_headers, "Content-Type": "application/json"},
+                  method="PUT",
+              ) as response:
                   print(f"Price history saved (HTTP {response.status}).")
           except Exception as exc:
               print(f"Could not save price history: {exc}", file=sys.stderr)
