@@ -1,0 +1,103 @@
+name: Check Veloretti outlet
+
+on:
+  schedule:
+    - cron: "7 9 * * *"
+      timezone: "Europe/Amsterdam"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check outlet and notify via ntfy
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+          from html.parser import HTMLParser
+
+          OUTLET = "https://www.veloretti.com/nl/outlet"
+          NEEDLE = "ace two pro black edition"
+          topic = os.environ.get("NTFY_TOPIC", "").strip()
+
+          class Links(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.href = None
+                  self.text = []
+                  self.items = []
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if tag == "a":
+                      self.href = attrs.get("href")
+                      self.text = []
+
+              def handle_data(self, data):
+                  if self.href is not None:
+                      self.text.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag == "a" and self.href is not None:
+                      self.items.append((self.href, " ".join(" ".join(self.text).split())))
+                      self.href = None
+                      self.text = []
+
+          req = urllib.request.Request(
+              OUTLET,
+              headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"}
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=25) as response:
+                  html = response.read().decode("utf-8", errors="replace")
+          except Exception as exc:
+              print(f"Could not fetch outlet page: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          parser = Links()
+          parser.feed(html)
+          matches = []
+          for href, title in parser.items:
+              normalized = re.sub(r"\\s+", " ", title).strip().lower()
+              if NEEDLE in normalized:
+                  url = urllib.parse.urljoin(OUTLET, href)
+                  if url not in matches:
+                      matches.append(url)
+
+          if not matches:
+              print("Ace Two Pro Black Edition not found.")
+              sys.exit(0)
+
+          if not topic:
+              print("Product found, but NTFY_TOPIC secret is not configured.", file=sys.stderr)
+              sys.exit(1)
+
+          message = "Ace Two Pro Black Edition is listed in the Veloretti Outlet:\\n" + "\\n".join(matches)
+          request = urllib.request.Request(
+              "https://ntfy.sh/" + urllib.parse.quote(topic, safe=""),
+              data=message.encode("utf-8"),
+              headers={
+                  "Title": "Veloretti outlet: fiets gevonden",
+                  "Priority": "high",
+                  "Tags": "bike",
+                  "Content-Type": "text/plain; charset=utf-8",
+              },
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  print(f"ntfy notification sent (HTTP {response.status}).")
+          except Exception as exc:
+              print(f"Could not send ntfy notification: {exc}", file=sys.stderr)
+              sys.exit(1)
+          PY
