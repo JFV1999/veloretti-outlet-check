@@ -89,8 +89,7 @@ for model, before, now in price_changes:
 if datetime.now(ZoneInfo("Europe/Amsterdam")).hour == 12:
     notifications.append((
         "Veloretti Ace Two - dagelijkse prijsupdate",
-        f"🚲 Ace Two Lite: {prices['lite']} | Ace Two Pro: {prices['pro']}\\n"
-        f"Bekijk de uitvoeringen: {CUSTOMIZER_URL}"
+        f"🚲 Ace Two Lite: {prices['lite']} | Ace Two Pro: {prices['pro']}. Bekijk de uitvoeringen: {CUSTOMIZER_URL}"
     ))
 
 
