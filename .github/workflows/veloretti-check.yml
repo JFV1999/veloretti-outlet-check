@@ -2,7 +2,7 @@ name: Check Veloretti outlet
 
 on:
   schedule:
-    - cron: "0 9,12,17 * * *"
+    - cron: "0 9-18 * * *"
       timezone: "Europe/Amsterdam"
   workflow_dispatch:
 
