@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - name: Check listings, detect price changes, and notify via ntfy
+      - name: Check outlet availability and official Ace Two prices
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -32,57 +32,77 @@ jobs:
           import urllib.parse
           import urllib.request
 
-          OUTLET = "https://www.veloretti.com/nl/outlet"
+          OUTLET_URL = "https://www.veloretti.com/nl/outlet"
+          CUSTOMIZER_URL = "https://www.veloretti.com/nl/electric-bikes/ace-two/customizer"
           STATE_PATH = "state/prices.json"
-          PRODUCT_RE = re.compile(r"ace\\s+two\\s+(?:pro|lite)", re.IGNORECASE)
-          topic_input = os.environ.get("NTFY_TOPIC", "").strip()
+          PRODUCT_RE = re.compile(r"ace\\s+two\\s+(pro|lite)", re.IGNORECASE)
 
-          def open_url(url, data=None, headers=None, method=None):
-              req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-              return urllib.request.urlopen(req, timeout=25)
+          def fetch(url):
+              request = urllib.request.Request(
+                  url, headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"}
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return response.read().decode("utf-8", errors="replace")
+
+          def plain_text(source):
+              source = html.unescape(source)
+              source = re.sub(r"<script\\b[^>]*>.*?</script>", " ", source, flags=re.I | re.S)
+              source = re.sub(r"<style\\b[^>]*>.*?</style>", " ", source, flags=re.I | re.S)
+              return re.sub(r"\\s+", " ", re.sub(r"<[^>]+>", " ", source)).strip()
 
           try:
-              with open_url(OUTLET, headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"}) as response:
-                  page = response.read().decode("utf-8", errors="replace")
+              outlet_html = fetch(OUTLET_URL)
+              customizer_html = fetch(CUSTOMIZER_URL)
           except Exception as exc:
-              print(f"Could not fetch outlet page: {exc}", file=sys.stderr)
+              print(f"Could not fetch Veloretti pages: {exc}", file=sys.stderr)
               sys.exit(1)
 
-          decoded = html.unescape(page).replace("\\/", "/")
-          anchors = list(re.finditer(
+          # Parse outlet product cards, matching product title and its own link.
+          outlet_source = html.unescape(outlet_html).replace("\\/", "/")
+          anchor_matches = list(re.finditer(
               r"""<a\\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""",
-              decoded,
-              flags=re.IGNORECASE | re.DOTALL,
+              outlet_source, re.I | re.S
           ))
-          found = {}
-          for match in anchors:
+          outlet_products = {}
+          for match in anchor_matches:
               href, anchor_html = match.groups()
-              title = re.sub(r"<[^>]+>", " ", anchor_html)
-              title = re.sub(r"\\s+", " ", html.unescape(title)).strip()
-              if not PRODUCT_RE.search(title):
+              title = re.sub(r"\\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", anchor_html))).strip()
+              model_match = PRODUCT_RE.search(title)
+              if not model_match:
                   continue
-              start, end = max(0, match.start() - 1400), min(len(decoded), match.end() + 1800)
-              card = re.sub(r"\\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", decoded[start:end]))).strip()
-              prices = re.findall(r"(?:€\\s*[0-9][0-9.]*(?:,[0-9]{2})?|[0-9][0-9.]*,[0-9]{2}\\s*€)", card)
-              price = re.sub(r"\\s+", "", prices[-1]) if prices else "unknown"
-              url = urllib.parse.urljoin(OUTLET, href)
-              key = urllib.parse.urlsplit(url)._replace(query="", fragment="").geturl()
-              found[key] = {"title": title, "url": url, "price": price}
+              model = model_match.group(1).lower()
+              url = urllib.parse.urljoin(OUTLET_URL, href)
+              if urllib.parse.urlparse(url).hostname not in ("www.veloretti.com", "veloretti.com"):
+                  continue
+              outlet_products[model] = {"title": title, "url": url}
 
-          if not found:
-              print("No Ace Two Pro or Ace Two Lite outlet listings found.")
-              sys.exit(0)
+          # Extract both configured prices from the customizer page, by label sections.
+          text = plain_text(customizer_html)
+          prices = {}
+          for model in ("lite", "pro"):
+              match = re.search(
+                  rf"\\b{model}\\b(.{{0,260}}?)(€\\s*[0-9][0-9.]*,[0-9]{{2}})",
+                  text, flags=re.I
+              )
+              if not match:
+                  # Some page layouts show price immediately before the model label.
+                  match = re.search(
+                      rf"(€\\s*[0-9][0-9.]*,[0-9]{{2}}).{{0,100}}?\\b{model}\\b",
+                      text, flags=re.I
+                  )
+              if not match:
+                  print(f"Could not extract {model.title()} price from customizer; aborting to avoid false alerts.", file=sys.stderr)
+                  sys.exit(1)
+              prices[model] = match.group(2) if match.lastindex and match.group(2) else match.group(1)
+              prices[model] = re.sub(r"\\s+", "", prices[model])
 
-          if not topic_input:
-              print("Products found, but NTFY_TOPIC secret is not configured.", file=sys.stderr)
-              sys.exit(1)
-          parsed_topic = urllib.parse.urlparse(topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input)
-          if parsed_topic.scheme != "https" or not parsed_topic.netloc or not parsed_topic.path.strip("/"):
-              print("NTFY_TOPIC must be an https ntfy topic URL or topic name.", file=sys.stderr)
-              sys.exit(1)
-          ntfy_url = f"https://{parsed_topic.netloc}/{parsed_topic.path.strip('/')}"
+          if not outlet_products:
+              print("No Ace Two Pro/Lite currently listed in outlet.")
+          else:
+              print("Outlet models found: " + ", ".join(sorted(outlet_products)))
 
-          api_base, repo, branch = "https://api.github.com", os.environ["REPOSITORY"], os.environ["BRANCH"]
+          repo, branch = os.environ["REPOSITORY"], os.environ["BRANCH"]
+          api_base = "https://api.github.com"
           api_headers = {
               "Accept": "application/vnd.github+json",
               "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
@@ -91,7 +111,8 @@ jobs:
           }
           state_url = f"{api_base}/repos/{repo}/contents/{STATE_PATH}?ref={urllib.parse.quote(branch)}"
           try:
-              with open_url(state_url, headers=api_headers) as response:
+              req = urllib.request.Request(state_url, headers=api_headers)
+              with urllib.request.urlopen(req, timeout=20) as response:
                   state_file = json.loads(response.read())
               old_state = json.loads(base64.b64decode(state_file["content"]).decode("utf-8"))
               state_sha = state_file["sha"]
@@ -99,56 +120,90 @@ jobs:
               if exc.code == 404:
                   old_state, state_sha = {}, None
               else:
-                  print(f"Could not load price history: {exc}", file=sys.stderr)
+                  print(f"Could not load saved state: {exc}", file=sys.stderr)
                   sys.exit(1)
-
-          # Initial observation establishes a baseline. Later changes are reported just once.
-          price_changes = []
-          for key, product in found.items():
-              previous = old_state.get(key)
-              if previous and previous.get("price") != "unknown" and product["price"] != "unknown" and previous.get("price") != product["price"]:
-                  price_changes.append((previous, product))
-
-          lines = [f"{p['title']} — {p['price']} — {p['url']}" for p in found.values()]
-          if price_changes:
-              title = "Veloretti outlet: prijs gewijzigd"
-              message = "Prijswijziging bij Veloretti outlet!\\n" + "\\n".join(
-                  f"{new['title']}: {old['price']} → {new['price']}\\n{new['url']}"
-                  for old, new in price_changes
-              )
-          else:
-              title = "Veloretti outlet: Ace Two beschikbaar"
-              message = "Ace Two Pro/Lite staat in de outlet:\\n" + "\\n".join(lines)
-
-          ntfy_req = urllib.request.Request(
-              ntfy_url, data=message.encode("utf-8"),
-              headers={"Title": title, "Priority": "high", "Tags": "bike", "Content-Type": "text/plain; charset=utf-8"},
-              method="POST",
-          )
-          try:
-              with urllib.request.urlopen(ntfy_req, timeout=20) as response:
-                  print(f"ntfy notification sent (HTTP {response.status}); {len(price_changes)} price change(s).")
           except Exception as exc:
-              print(f"Could not send ntfy notification: {exc}", file=sys.stderr)
+              print(f"Could not read saved state: {exc}", file=sys.stderr)
               sys.exit(1)
 
-          state = {key: product for key, product in found.items()}
+          old_prices = old_state.get("customizer_prices", {})
+          price_changes = []
+          for model in ("lite", "pro"):
+              before, now = old_prices.get(model), prices[model]
+              if before and before != now:
+                  price_changes.append((model, before, now))
+
+          # Notify about outlet appearance only on transition to listed, preventing repeats.
+          old_outlet = old_state.get("outlet_models", {})
+          newly_listed = [model for model in outlet_products if model not in old_outlet]
+
+          notifications = []
+          if newly_listed:
+              lines = [
+                  f"{outlet_products[m]['title']}: {outlet_products[m]['url']}"
+                  for m in newly_listed
+              ]
+              notifications.append((
+                  "Veloretti outlet: Ace Two gevonden",
+                  "Nieuw in de outlet:\\n" + "\\n".join(lines),
+              ))
+          if price_changes:
+              lines = [
+                  f"Ace Two {model.title()}: {before} → {now}\\n{CUSTOMIZER_URL}"
+                  for model, before, now in price_changes
+              ]
+              notifications.append((
+                  "Veloretti: prijs gewijzigd",
+                  "Prijswijziging op de Ace Two customizerpagina:\\n" + "\\n".join(lines),
+              ))
+
+          if notifications:
+              topic_input = os.environ.get("NTFY_TOPIC", "").strip()
+              parsed = urllib.parse.urlparse(
+                  topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input
+              )
+              if parsed.scheme != "https" or not parsed.netloc or not parsed.path.strip("/"):
+                  print("NTFY_TOPIC must contain an https ntfy topic URL or topic name.", file=sys.stderr)
+                  sys.exit(1)
+              ntfy_url = f"https://{parsed.netloc}/{parsed.path.strip('/')}"
+              for title, message in notifications:
+                  req = urllib.request.Request(
+                      ntfy_url, data=message.encode("utf-8"),
+                      headers={"Title": title, "Priority": "high", "Tags": "bike",
+                               "Content-Type": "text/plain; charset=utf-8"},
+                      method="POST"
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=20) as response:
+                          print(f"Sent notification: {title} (HTTP {response.status}).")
+                  except Exception as exc:
+                      print(f"Could not send ntfy notification: {exc}", file=sys.stderr)
+                      sys.exit(1)
+          else:
+              print("No new outlet listing or price change; no notification.")
+
+          # Save current official prices and outlet state for one-time transition alerts.
+          state = {
+              "customizer_prices": prices,
+              "outlet_models": outlet_products,
+          }
           body = {
-              "message": "Update tracked Veloretti outlet prices",
+              "message": "Update Veloretti outlet and price state",
               "content": base64.b64encode(json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
               "branch": branch,
           }
           if state_sha:
               body["sha"] = state_sha
+          req = urllib.request.Request(
+              f"{api_base}/repos/{repo}/contents/{STATE_PATH}",
+              data=json.dumps(body).encode("utf-8"),
+              headers={**api_headers, "Content-Type": "application/json"},
+              method="PUT",
+          )
           try:
-              with open_url(
-                  f"{api_base}/repos/{repo}/contents/{STATE_PATH}",
-                  data=json.dumps(body).encode("utf-8"),
-                  headers={**api_headers, "Content-Type": "application/json"},
-                  method="PUT",
-              ) as response:
-                  print(f"Price history saved (HTTP {response.status}).")
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  print(f"Saved current state (HTTP {response.status}); customizer prices: {prices}.")
           except Exception as exc:
-              print(f"Could not save price history: {exc}", file=sys.stderr)
+              print(f"Could not save state: {exc}", file=sys.stderr)
               sys.exit(1)
           PY
