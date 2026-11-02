@@ -38,10 +38,8 @@ jobs:
           PRODUCT_RE = re.compile(r"ace\\s+two\\s+(pro|lite)", re.IGNORECASE)
 
           def fetch(url):
-              request = urllib.request.Request(
-                  url, headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"}
-              )
-              with urllib.request.urlopen(request, timeout=30) as response:
+              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; VelorettiOutletChecker/1.0)"})
+              with urllib.request.urlopen(req, timeout=30) as response:
                   return response.read().decode("utf-8", errors="replace")
 
           def plain_text(source):
@@ -57,49 +55,32 @@ jobs:
               print(f"Could not fetch Veloretti pages: {exc}", file=sys.stderr)
               sys.exit(1)
 
-          # Parse outlet product cards, matching product title and its own link.
           outlet_source = html.unescape(outlet_html).replace("\\/", "/")
-          anchor_matches = list(re.finditer(
-              r"""<a\\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""",
-              outlet_source, re.I | re.S
-          ))
+          anchor_pattern = r"""<a\\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>"""
           outlet_products = {}
-          for match in anchor_matches:
-              href, anchor_html = match.groups()
+          for href, anchor_html in re.findall(anchor_pattern, outlet_source, flags=re.I | re.S):
               title = re.sub(r"\\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", anchor_html))).strip()
               model_match = PRODUCT_RE.search(title)
               if not model_match:
                   continue
-              model = model_match.group(1).lower()
               url = urllib.parse.urljoin(OUTLET_URL, href)
               if urllib.parse.urlparse(url).hostname not in ("www.veloretti.com", "veloretti.com"):
                   continue
-              outlet_products[model] = {"title": title, "url": url}
+              outlet_products[model_match.group(1).lower()] = {"title": title, "url": url}
 
-          # Extract both configured prices from the customizer page, by label sections.
-          text = plain_text(customizer_html)
+          # The live customizer page lists the Lite section and its price, then the Pro section and price.
+          customizer_text = plain_text(customizer_html)
           prices = {}
-          for model in ("lite", "pro"):
-              match = re.search(
-                  rf"\\b{model}\\b(.{{0,260}}?)(€\\s*[0-9][0-9.]*,[0-9]{{2}})",
-                  text, flags=re.I
-              )
-              if not match:
-                  # Some page layouts show price immediately before the model label.
-                  match = re.search(
-                      rf"(€\\s*[0-9][0-9.]*,[0-9]{{2}}).{{0,100}}?\\b{model}\\b",
-                      text, flags=re.I
-                  )
-              if not match:
-                  print(f"Could not extract {model.title()} price from customizer; aborting to avoid false alerts.", file=sys.stderr)
+          for model, next_model in (("lite", "pro"), ("pro", "model wijzigen")):
+              section = re.search(rf"\\b{model}\\b(.*?)(?=\\b{next_model}\\b)", customizer_text, flags=re.I)
+              if not section:
+                  print(f"Could not find {model.title()} price section.", file=sys.stderr)
                   sys.exit(1)
-              prices[model] = match.group(2) if match.lastindex and match.group(2) else match.group(1)
-              prices[model] = re.sub(r"\\s+", "", prices[model])
-
-          if not outlet_products:
-              print("No Ace Two Pro/Lite currently listed in outlet.")
-          else:
-              print("Outlet models found: " + ", ".join(sorted(outlet_products)))
+              price = re.search(r"€\\s*[0-9][0-9.]*,[0-9]{2}", section.group(1))
+              if not price:
+                  print(f"Could not extract {model.title()} price; aborting to avoid false alerts.", file=sys.stderr)
+                  sys.exit(1)
+              prices[model] = re.sub(r"\\s+", "", price.group(0))
 
           repo, branch = os.environ["REPOSITORY"], os.environ["BRANCH"]
           api_base = "https://api.github.com"
@@ -120,58 +101,47 @@ jobs:
               if exc.code == 404:
                   old_state, state_sha = {}, None
               else:
-                  print(f"Could not load saved state: {exc}", file=sys.stderr)
+                  print(f"Could not load saved state: HTTP {exc.code}", file=sys.stderr)
                   sys.exit(1)
           except Exception as exc:
               print(f"Could not read saved state: {exc}", file=sys.stderr)
               sys.exit(1)
 
-          old_prices = old_state.get("customizer_prices", {})
-          price_changes = []
-          for model in ("lite", "pro"):
-              before, now = old_prices.get(model), prices[model]
-              if before and before != now:
-                  price_changes.append((model, before, now))
-
-          # Notify about outlet appearance only on transition to listed, preventing repeats.
+          price_changes = [
+              (model, old_state["customizer_prices"][model], prices[model])
+              for model in ("lite", "pro")
+              if model in old_state.get("customizer_prices", {})
+              and old_state["customizer_prices"][model] != prices[model]
+          ]
           old_outlet = old_state.get("outlet_models", {})
           newly_listed = [model for model in outlet_products if model not in old_outlet]
 
           notifications = []
-          if newly_listed:
-              lines = [
-                  f"{outlet_products[m]['title']}: {outlet_products[m]['url']}"
-                  for m in newly_listed
-              ]
+          for model in newly_listed:
+              product = outlet_products[model]
               notifications.append((
                   "Hij is nu beschikbaar!",
-                  "Deze fiets is nu beschikbaar in de Veloretti-outlet.\\nKoop hem hier:\\n" + "\\n".join(lines),
+                  f"{product['title']} is nu beschikbaar in de Veloretti-outlet.\\nKoop hem hier: {product['url']}"
               ))
-          if price_changes:
-              lines = [
-                  f"Ace Two {model.title()}\\nOude prijs: {before}\\nNieuwe prijs: {now}\\nBekijk de pagina: {CUSTOMIZER_URL}"
-                  for model, before, now in price_changes
-              ]
+          for model, before, now in price_changes:
               notifications.append((
                   "Let op, prijsverandering",
-                  "De prijs van de Ace Two is veranderd.\\n\\n" + "\\n\\n".join(lines),
+                  f"Ace Two {model.title()}\\nOude prijs: {before}\\nNieuwe prijs: {now}\\nBekijk de pagina: {CUSTOMIZER_URL}"
               ))
 
           if notifications:
               topic_input = os.environ.get("NTFY_TOPIC", "").strip()
-              parsed = urllib.parse.urlparse(
-                  topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input
-              )
+              parsed = urllib.parse.urlparse(topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input)
               if parsed.scheme != "https" or not parsed.netloc or not parsed.path.strip("/"):
                   print("NTFY_TOPIC must contain an https ntfy topic URL or topic name.", file=sys.stderr)
                   sys.exit(1)
               ntfy_url = f"https://{parsed.netloc}/{parsed.path.strip('/')}"
               for title, message in notifications:
                   req = urllib.request.Request(
-                      ntfy_url, data=message.encode("utf-8"),
-                      headers={"Title": title, "Priority": "high", "Tags": "bike",
-                               "Content-Type": "text/plain; charset=utf-8"},
-                      method="POST"
+                      ntfy_url,
+                      data=message.encode("utf-8"),
+                      headers={"Title": title, "Priority": "high", "Tags": "bike", "Content-Type": "text/plain; charset=utf-8"},
+                      method="POST",
                   )
                   try:
                       with urllib.request.urlopen(req, timeout=20) as response:
@@ -182,11 +152,7 @@ jobs:
           else:
               print("No new outlet listing or price change; no notification.")
 
-          # Save current official prices and outlet state for one-time transition alerts.
-          state = {
-              "customizer_prices": prices,
-              "outlet_models": outlet_products,
-          }
+          state = {"customizer_prices": prices, "outlet_models": outlet_products}
           body = {
               "message": "Update Veloretti outlet and price state",
               "content": base64.b64encode(json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
@@ -202,8 +168,8 @@ jobs:
           )
           try:
               with urllib.request.urlopen(req, timeout=20) as response:
-                  print(f"Saved current state (HTTP {response.status}); customizer prices: {prices}.")
+                  print(f"Saved current state (HTTP {response.status}); prices: {prices}.")
           except Exception as exc:
-              print(f"Could not save state: {exc}", file=sys.stderr)
+              print(f"Could not save state: HTTP {getattr(exc, 'code', 'unknown')}", file=sys.stderr)
               sys.exit(1)
           PY
