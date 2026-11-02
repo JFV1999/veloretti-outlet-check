@@ -19,39 +19,17 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
           python - <<'PY'
+          import html
+          import json
           import os
           import re
           import sys
           import urllib.parse
           import urllib.request
-          from html.parser import HTMLParser
 
           OUTLET = "https://www.veloretti.com/nl/outlet"
           NEEDLE = "ace two pro black edition"
           topic = os.environ.get("NTFY_TOPIC", "").strip()
-
-          class Links(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.href = None
-                  self.text = []
-                  self.items = []
-
-              def handle_starttag(self, tag, attrs):
-                  attrs = dict(attrs)
-                  if tag == "a":
-                      self.href = attrs.get("href")
-                      self.text = []
-
-              def handle_data(self, data):
-                  if self.href is not None:
-                      self.text.append(data)
-
-              def handle_endtag(self, tag):
-                  if tag == "a" and self.href is not None:
-                      self.items.append((self.href, " ".join(" ".join(self.text).split())))
-                      self.href = None
-                      self.text = []
 
           req = urllib.request.Request(
               OUTLET,
@@ -59,30 +37,37 @@ jobs:
           )
           try:
               with urllib.request.urlopen(req, timeout=25) as response:
-                  html = response.read().decode("utf-8", errors="replace")
+                  page = response.read().decode("utf-8", errors="replace")
           except Exception as exc:
               print(f"Could not fetch outlet page: {exc}", file=sys.stderr)
               sys.exit(1)
 
-          parser = Links()
-          parser.feed(html)
-          matches = []
-          for href, title in parser.items:
-              normalized = re.sub(r"\\s+", " ", title).strip().lower()
-              if NEEDLE in normalized:
-                  url = urllib.parse.urljoin(OUTLET, href)
-                  if url not in matches:
-                      matches.append(url)
+          decoded = html.unescape(page)
+          normalized = re.sub(r"\\s+", " ", re.sub(r"<[^>]+>", " ", decoded)).lower()
+          if NEEDLE not in normalized:
+              # Shopify pages may include product data as JSON in the source. Check decoded source too.
+              if NEEDLE not in re.sub(r"\\s+", " ", decoded.lower()):
+                  print("Ace Two Pro Black Edition not found.")
+                  sys.exit(0)
 
-          if not matches:
-              print("Ace Two Pro Black Edition not found.")
-              sys.exit(0)
+          links = re.findall(r"""href=["']([^"']+)["']""", decoded, flags=re.IGNORECASE)
+          candidate_urls = []
+          for href in links:
+              url = urllib.parse.urljoin(OUTLET, href.replace("\\/", "/"))
+              if "veloretti.com" in urllib.parse.urlparse(url).netloc and url not in candidate_urls:
+                  candidate_urls.append(url)
+
+          product_urls = [
+              url for url in candidate_urls
+              if "ace" in url.lower() and ("two" in url.lower() or "pro" in url.lower())
+          ]
+          product_url = product_urls[0] if product_urls else OUTLET
 
           if not topic:
               print("Product found, but NTFY_TOPIC secret is not configured.", file=sys.stderr)
               sys.exit(1)
 
-          message = "Ace Two Pro Black Edition is listed in the Veloretti Outlet:\\n" + "\\n".join(matches)
+          message = f"Ace Two Pro Black Edition is listed in the Veloretti Outlet: {product_url}"
           request = urllib.request.Request(
               "https://ntfy.sh/" + urllib.parse.quote(topic, safe=""),
               data=message.encode("utf-8"),
