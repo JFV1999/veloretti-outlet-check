@@ -1,4 +1,6 @@
 import html
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import json
 import os
 import re
@@ -83,6 +85,16 @@ for model in newly_listed:
 for model, before, now in price_changes:
     notifications.append(("Let op, prijsverandering",
         f"Ace Two {model.title()}\nOude prijs: {before}\nNieuwe prijs: {now}\nBekijk de pagina: {CUSTOMIZER_URL}"))
+# Send a daily current-price digest during the noon run (Amsterdam time).
+if datetime.now(ZoneInfo("Europe/Amsterdam")).hour == 12:
+    notifications.append((
+        "Veloretti Ace Two - dagelijkse prijsupdate",
+        "🚲 Huidige prijzen van de Ace Two\\n"
+        f"Lite: {prices['lite']}\\n"
+        f"Pro: {prices['pro']}\\n"
+        f"Bekijk de uitvoeringen: {CUSTOMIZER_URL}"
+    ))
+
 
 if notifications:
     topic = os.environ.get("NTFY_TOPIC", "").strip()
