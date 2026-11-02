@@ -2,7 +2,7 @@ name: Check Veloretti outlet
 
 on:
   schedule:
-    - cron: "7 9 * * *"
+    - cron: "0 9,12,17 * * *"
       timezone: "Europe/Amsterdam"
   workflow_dispatch:
 
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Check outlet and notify via ntfy
+      - name: Check outlet for Ace Two Pro or Lite and notify via ntfy
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
@@ -27,7 +27,7 @@ jobs:
           import urllib.request
 
           OUTLET = "https://www.veloretti.com/nl/outlet"
-          NEEDLE = "ace two pro black edition"
+          PRODUCT_RE = re.compile(r"ace\\s+two\\s+(?:pro|lite)", re.IGNORECASE)
           topic_input = os.environ.get("NTFY_TOPIC", "").strip()
 
           req = urllib.request.Request(
@@ -41,24 +41,20 @@ jobs:
               print(f"Could not fetch outlet page: {exc}", file=sys.stderr)
               sys.exit(1)
 
-          decoded = html.unescape(page)
-          normalized = re.sub(r"\\s+", " ", re.sub(r"<[^>]+>", " ", decoded)).lower()
-          if NEEDLE not in normalized and NEEDLE not in re.sub(r"\\s+", " ", decoded.lower()):
-              print("Ace Two Pro Black Edition not found.")
+          decoded = html.unescape(page).replace("\\/", "/")
+          links = re.findall(r"""<a\\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>""", decoded, flags=re.IGNORECASE | re.DOTALL)
+          found = []
+          for href, anchor_html in links:
+              title = re.sub(r"<[^>]+>", " ", anchor_html)
+              title = re.sub(r"\\s+", " ", html.unescape(title)).strip()
+              if PRODUCT_RE.search(title):
+                  url = urllib.parse.urljoin(OUTLET, href)
+                  if url not in [item["url"] for item in found]:
+                      found.append({"title": title, "url": url})
+
+          if not found:
+              print("Ace Two Pro or Ace Two Lite not found in outlet.")
               sys.exit(0)
-
-          links = re.findall(r"""href=["']([^"']+)["']""", decoded, flags=re.IGNORECASE)
-          candidate_urls = []
-          for href in links:
-              url = urllib.parse.urljoin(OUTLET, href.replace("\\/", "/"))
-              if "veloretti.com" in urllib.parse.urlparse(url).netloc and url not in candidate_urls:
-                  candidate_urls.append(url)
-
-          product_urls = [
-              url for url in candidate_urls
-              if "ace" in url.lower() and ("two" in url.lower() or "pro" in url.lower())
-          ]
-          product_url = product_urls[0] if product_urls else OUTLET
 
           if not topic_input:
               print("Product found, but NTFY_TOPIC secret is not configured.", file=sys.stderr)
@@ -67,21 +63,18 @@ jobs:
           parsed_topic = urllib.parse.urlparse(
               topic_input if "://" in topic_input else "https://ntfy.sh/" + topic_input
           )
-          if parsed_topic.scheme != "https" or not parsed_topic.netloc:
+          if parsed_topic.scheme != "https" or not parsed_topic.netloc or not parsed_topic.path.strip("/"):
               print("NTFY_TOPIC must be an https ntfy topic URL or topic name.", file=sys.stderr)
               sys.exit(1)
-          topic_path = parsed_topic.path.strip("/")
-          if not topic_path:
-              print("NTFY_TOPIC URL must include a topic name.", file=sys.stderr)
-              sys.exit(1)
-          ntfy_url = f"https://{parsed_topic.netloc}/{topic_path}"
+          ntfy_url = f"https://{parsed_topic.netloc}/{parsed_topic.path.strip('/')}"
 
-          message = f"Ace Two Pro Black Edition is listed in the Veloretti Outlet: {product_url}"
+          listing_lines = "\\n".join(f"{item['title']}: {item['url']}" for item in found)
+          message = "Veloretti outlet heeft een Ace Two Pro of Ace Two Lite gevonden:\\n" + listing_lines
           request = urllib.request.Request(
               ntfy_url,
               data=message.encode("utf-8"),
               headers={
-                  "Title": "Veloretti outlet: fiets gevonden",
+                  "Title": "Veloretti outlet: Ace Two gevonden",
                   "Priority": "high",
                   "Tags": "bike",
                   "Content-Type": "text/plain; charset=utf-8",
